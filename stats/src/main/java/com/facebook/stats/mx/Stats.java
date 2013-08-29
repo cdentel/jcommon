@@ -16,20 +16,27 @@
 package com.facebook.stats.mx;
 
 
-import com.facebook.stats.MultiWindowDistribution;
-import com.facebook.stats.MultiWindowRate;
-import com.facebook.stats.MultiWindowSpread;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testng.collections.Maps;
+
+import com.facebook.stats.MultiWindowDistribution;
+import com.facebook.stats.MultiWindowRate;
+import com.facebook.stats.MultiWindowSpread;
+import com.google.common.collect.ImmutableSet;
+
 public class Stats implements StatsReader, StatsCollector {
+
   private static final Logger LOG = LoggerFactory.getLogger(Stats.class);
   private static final String ERROR_FLAG = "--ERROR--";
 
@@ -42,6 +49,9 @@ public class Stats implements StatsReader, StatsCollector {
   private final ConcurrentMap<String, MultiWindowSpread> spreads = new ConcurrentHashMap<>();
   private final ConcurrentMap<String, MultiWindowDistribution> distributions =
     new ConcurrentHashMap<>();
+
+  private Map<String, Set<CounterExportType>> exportTypeFilter = Maps
+      .newHashMap();
 
   public Stats(String prefix) {
     this.prefix = prefix;
@@ -62,48 +72,72 @@ public class Stats implements StatsReader, StatsCollector {
 
       if (existingRate != null) {
         rate = existingRate;
+      } else {
+        addNewKey(key);
       }
     }
 
     return rate;
   }
 
-  @Override
-  public void exportCounters(Map<String, Long> counterMap) {
-    for (Map.Entry<String, MultiWindowRate> entry : rates.entrySet()) {
-      StatsUtil.addRateAndSumToCounters(
-        prefix + entry.getKey(), entry.getValue(), counterMap
-      );
+  public void addStatExportType(String key, CounterExportType type) {
+    if (exportTypeFilter.get(key) == CounterExportType.ALL_EXPORT_TYPES) {
+      exportTypeFilter.put(key, EnumSet.of(type));
+    } else {
+      exportTypeFilter.get(key).add(type);
     }
+  }
 
-    for (Map.Entry<String, MultiWindowSpread> entry : spreads.entrySet()) {
-      StatsUtil.addSpreadToCounters(
-        prefix + entry.getKey(), entry.getValue(), counterMap
-      );
+  private void addNewKey(String key) {
+    if (!exportTypeFilter.containsKey(key)) {
+      exportTypeFilter.put(key, CounterExportType.ALL_EXPORT_TYPES);
     }
+  }
 
-    for (Map.Entry<String, MultiWindowDistribution> entry : distributions.entrySet()) {
-      StatsUtil.addQuantileToCounters(
-        prefix + entry.getKey(), entry.getValue(), counterMap
-      );
-    }
-
-    Long duplicate = null;
-    for (Map.Entry<String, AtomicLong> entry : counters.entrySet()) {
-      duplicate = counterMap.put(prefix + entry.getKey(), entry.getValue().get());
-      if (duplicate != null) {
-        LOG.warn("Duplicate counter : {}, Ignoring old value {}", prefix + entry.getKey(), duplicate);
-      }
-    }
-
-    for (Map.Entry<String, Callable<Long>> entry : dynamicCounters.entrySet()) {
-      try {
-        duplicate = counterMap.put(prefix + entry.getKey(), entry.getValue().call());
-        if (duplicate != null) {
-          LOG.warn("Duplicate counter : {}, Ignoring old value {}", prefix + entry.getKey(), duplicate);
+  public void exportCounters(Map<String, Long> counterMap) {    
+    for (Entry<String, Set<CounterExportType>> entry : exportTypeFilter.entrySet()) {
+      for (CounterExportType type : entry.getValue()) {
+        switch (type) {
+        case SUM:
+          StatsUtil.addSumToCounters(prefix + entry.getKey(),
+              rates.get(entry.getKey()),
+              counterMap);
+          break;
+        case RATE:
+          StatsUtil.addRateToCounters(prefix + entry.getKey(),
+              rates.get(entry.getKey()), counterMap);
+          break;
+        case SPREAD:
+          StatsUtil.addSpreadToCounters(prefix + entry.getKey(),
+              spreads.get(entry.getKey()), counterMap);
+          break;
+        case QUANTILE:
+          StatsUtil.addQuantileToCounters(prefix + entry.getKey(),
+              distributions.get(entry.getKey()), counterMap);
+          break;
+        case COUNTER:
+          Long duplicate = null;
+          duplicate = counterMap.put(prefix + entry.getKey(), counters.get(entry.getKey())
+              .get());
+          if (duplicate != null) {
+            LOG.warn("Duplicate counter : {}, Ignoring old value {}", prefix
+                + entry.getKey(), duplicate);
+          }
+          break;
+        case DYNAMIC_COUNTER:
+          try {
+            duplicate =
+                counterMap.put(prefix + entry.getKey(), dynamicCounters.get(entry.getKey()).call());
+            if (duplicate != null) {
+              LOG.warn("Duplicate counter : {}, Ignoring old value {}", prefix
+                  + entry.getKey(), duplicate);
+            }
+          } catch (Exception e) {
+            LOG.debug("Exception when generating dynamic counter value for {}",
+                entry.getKey(), e);
+          }
+          break;
         }
-      } catch (Exception e) {
-        LOG.debug("Exception when generating dynamic counter value for {}", entry.getKey(), e);
       }
     }
   }
@@ -148,6 +182,8 @@ public class Stats implements StatsReader, StatsCollector {
 
       if (existingValue != null) {
         value = existingValue;
+      } else {
+        addNewKey(key);
       }
     }
 
@@ -166,6 +202,7 @@ public class Stats implements StatsReader, StatsCollector {
     return StatsUtil.setCounterValue(key, value, this);
   }
 
+  @Override
   public long resetCounter(StatType key) {
     return internalResetCounter(key.getKey());
   }
@@ -181,6 +218,7 @@ public class Stats implements StatsReader, StatsCollector {
     return value == null ? 0 : value.get();
   }
 
+  @Override
   public void incrementSpread(StatType type, long value) {
     getMultiWindowSpread(type.getKey()).add(value);  }
 
@@ -239,7 +277,11 @@ public class Stats implements StatsReader, StatsCollector {
    * already
    */
   public boolean addDynamicCounter(String key, Callable<Long> valueProducer) {
-    return null == dynamicCounters.putIfAbsent(key, valueProducer);
+    Callable<Long> result = dynamicCounters.putIfAbsent(key, valueProducer);
+    if (result == null) {
+      addNewKey(key);
+    }
+    return result == null;
   }
 
   /**
@@ -342,6 +384,8 @@ public class Stats implements StatsReader, StatsCollector {
 
       if (existingSpreads != null) {
         spread = existingSpreads;
+      } else {
+        addNewKey(key);
       }
     }
 
@@ -357,12 +401,27 @@ public class Stats implements StatsReader, StatsCollector {
 
       if (existing != null) {
         distribution = existing;
+      } else {
+        addNewKey(key);
       }
     }
 
     return distribution;
   }
 
+  public enum CounterExportType {
+    SUM,
+    RATE,
+    QUANTILE,
+    SPREAD,
+    COUNTER,
+    DYNAMIC_COUNTER;
+
+    public static final ImmutableSet<CounterExportType> ALL_EXPORT_TYPES =
+        ImmutableSet
+        .copyOf(CounterExportType.values());
+
+  }
 
 
   private static class StringProducer implements Callable<String> {
